@@ -1,0 +1,6 @@
+# Dynamic configuration for Traefik
+# ServersTransport for Portainer (accepts self-signed backend cert)
+http:
+  serversTransports:
+    portainer-transport:
+      insecureSkipVerify: true

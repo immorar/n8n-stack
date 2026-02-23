@@ -1,0 +1,180 @@
+services:
+  traefik:
+    image: traefik:v3.6.8
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      # Providers
+      # Docker provider
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      # File provider (ServersTransport for Portainer)
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --providers.file.watch=true
+
+      # EntryPoints
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+
+      # HTTP -> HTTPS
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+
+      # Let's Encrypt (HTTP challenge)
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+
+      # Dashboard (solo interno, vía 127.0.0.1:8080) / API
+      - --api.dashboard=true
+
+    ports:
+      - "80:80"
+      - "443:443"
+      # (Opcional) Dashboard Traefik en :8080 (recomendado NO exponer público)
+      # - "8080:8080"
+      # Dashboard solo accesible desde el VPS (loopback)
+      - "127.0.0.1:8080:8080" # Exponer el dashboard por IP local
+      # Nota: Traefik sirve su dashboard en :8080 cuando --api.dashboard=true está activo.
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./letsencrypt:/letsencrypt
+      - ./traefik-dynamic.yml:/etc/traefik/dynamic.yml:ro
+
+    networks:
+      - proxy
+
+    labels:
+      # (Opcional) Si decides exponer dashboard por dominio, se hace aquí.
+      # Por seguridad, mejor dejarlo sin exponer o limitarlo por IP/autenticación.
+      - traefik.enable=true
+
+      # Router para dashboard (subdominio). Dashboard: https://traefik.pixelia.cloud
+      # Descomentar si se quiere exponer el dashboard por dominio
+      # - traefik.http.routers.traefik.rule=Host(`${TRAEFIK_DOMAIN}`)
+      # - traefik.http.routers.traefik.entrypoints=websecure
+      # - traefik.http.routers.traefik.tls=true
+      # - traefik.http.routers.traefik.tls.certresolver=letsencrypt
+      # - traefik.http.routers.traefik.service=api@internal
+
+      # Basic Auth (ya no es necesario si no lo expones)
+      # - traefik.http.middlewares.traefik-auth.basicauth.users=admin:REEMPLAZA_ESTO_POR_TU_HASH
+      # - traefik.http.routers.traefik.middlewares=traefik-auth
+
+      # (MUY recomendado) Basic Auth para no dejarlo público sin seguridad:
+      # Genera el hash con:
+      #   htpasswd -nbB admin 'TU_PASSWORD' | sed -e s/\\$/\\$\\$/g
+      #   y pega el resultado en la línea de abajo:
+      # - traefik.http.middlewares.traefik-auth.basicauth.users=admin:REEMPLAZA_ESTO_POR_TU_HASH
+      # - traefik.http.routers.traefik.middlewares=traefik-auth
+
+      # Acceso solo por IP
+      # - traefik.http.middlewares.traefik-ip.ipallowlist.sourcerange=TU_IP/32
+      # - traefik.http.routers.traefik.middlewares=traefik-ip
+
+  n8n:
+    # image: docker.n8n.io/n8nio/n8n:latest
+    image: docker.n8n.io/n8nio/n8n:2.8.3
+    container_name: n8n
+    restart: unless-stopped
+    networks:
+      - proxy
+
+    # IMPORTANTE: ya no exponemos 5678 al host público
+    # No publicamos 5678 al host (solo interno para Traefik)
+    expose:
+      - "5678"
+
+    environment:
+      - TZ=${TZ}
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+
+      # HTTPS (detrás de Traefik)
+      - N8N_PROTOCOL=https
+      - N8N_HOST=${N8N_DOMAIN}
+      - N8N_EDITOR_BASE_URL=https://${N8N_DOMAIN}/
+      - WEBHOOK_URL=https://${N8N_DOMAIN}/
+      - N8N_SECURE_COOKIE=true
+
+      # Encriptación de credenciales
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+
+      # (Opcional recomendado) Si tendrás webhooks/tiempo real más estable
+      # - N8N_PUSH_BACKEND=websocket
+
+      # Opcional: settings de ejecución
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=504
+      - EXECUTIONS_DATA_PRUNE_MAX_COUNT=10000
+      - N8N_CONCURRENCY_PRODUCTION_LIMIT=12
+
+      # Opcional: migrar storage de filesystem a MongoDB
+      # Deprecation warning: The storage directory "/home/node/.n8n/binaryData" will be renamed to "/home/node/.n8n/storage" in n8n v3.
+      - N8N_MIGRATE_FS_STORAGE_PATH=true
+
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+    ports:
+      - "127.0.0.1:5678:5678"
+
+    labels:
+      - traefik.enable=true
+
+      # Router HTTPS
+      - traefik.http.routers.n8n.rule=Host(`${N8N_DOMAIN}`)
+      - traefik.http.routers.n8n.entrypoints=websecure
+      - traefik.http.routers.n8n.tls=true
+      - traefik.http.routers.n8n.tls.certresolver=letsencrypt
+      
+      # Service -> puerto interno del contenedor
+      - traefik.http.services.n8n.loadbalancer.server.port=5678
+
+  portainer:
+    image: portainer/portainer-ce:lts
+    container_name: portainer
+    restart: unless-stopped
+    networks:
+      - proxy
+
+    # Solo interno (visible para Traefik, no público)
+    expose:
+      - "9443"
+      # Si NO usas Edge Agents, puedes quitar 8000
+      - "8000"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+    labels:
+      - traefik.enable=true
+
+      # Router HTTPS por dominio
+      - traefik.http.routers.portainer.rule=Host(`${PORTAINER_DOMAIN}`)
+      - traefik.http.routers.portainer.entrypoints=websecure
+      - traefik.http.routers.portainer.tls=true
+      - traefik.http.routers.portainer.tls.certresolver=letsencrypt
+
+      # Portainer sirve HTTPS en 9443 con self-signed por defecto
+      - traefik.http.services.portainer.loadbalancer.server.port=9443
+      - traefik.http.services.portainer.loadbalancer.server.scheme=https
+
+      # Traefik debe aceptar el cert self-signed de Portainer (transport en traefik-dynamic.yml)
+      # -traefik.http.services.serversTransport.portainer-transport.insecureSkipVerify=true
+      - traefik.http.services.portainer.loadbalancer.serverstransport=portainer-transport@file
+
+volumes:
+  # Esto referencia el volumen existente (NO lo recrea ni borra)
+  n8n_data:
+    external: true
+  portainer_data:
+    external: true
+
+networks:
+  proxy:
+    name: proxy
