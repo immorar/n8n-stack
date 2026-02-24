@@ -22,8 +22,8 @@ Esta guía **paso a paso** te lleva desde una instalación existente (n8n/Portai
 
 ## Dominios usados
 
-- **n8n:** `https://n8n-devtallez.pixelia.cloud`
-- **Portainer:** `https://portainer.pixelia.cloud`
+- **n8n:** `https://n8n-devtallez.{VPS_DOMAIN}`
+- **Portainer:** `https://portainer.{VPS_DOMAIN}`
 - **Traefik dashboard:** **NO público** (solo interno por SSH tunnel)
 
 ## Qué puertos quedan expuestos
@@ -47,9 +47,9 @@ Esta guía **paso a paso** te lleva desde una instalación existente (n8n/Portai
 1. **VPS Ubuntu** (con acceso SSH)
 2. **Docker** y **Docker Compose plugin** instalados
 3. **DNS** configurado apuntando a la IP del VPS:
-   - `n8n-devtallez.pixelia.cloud`
-   - `portainer.pixelia.cloud`
-   - `traefik.pixelia.cloud` *(aunque el dashboard no será público)*
+   - `n8n-devtallez.{VPS_DOMAIN}`
+   - `portainer.{VPS_DOMAIN}`
+   - `traefik.{VPS_DOMAIN}` *(aunque el dashboard no será público)*
 4. **Firewall** permitiendo `80` y `443`
 5. Volúmenes existentes:
    - `n8n_data`
@@ -99,7 +99,7 @@ docker volume create portainer_data
 
 ## Paso 3) Detener y eliminar contenedores actuales (sin borrar datos)
 
-> Esto **no borra tus datos**, porque los datos viven en los volúmenes.
+> Esto **no borra tus datos (workflows, credenciales, configuraciones, etc.)**, porque los datos viven en los volúmenes (n8n_data, portainer_data).
 
 ```bash
 docker stop n8n portainer
@@ -130,9 +130,9 @@ Pega este contenido completo:
 
 ```env
 # Dominios
-N8N_DOMAIN=n8n-devtallez.pixelia.cloud
-PORTAINER_DOMAIN=portainer.pixelia.cloud
-TRAEFIK_DOMAIN=traefik.pixelia.cloud
+N8N_DOMAIN=n8n-devtallez.{VPS_DOMAIN}
+PORTAINER_DOMAIN=portainer.{VPS_DOMAIN}
+TRAEFIK_DOMAIN=traefik.{VPS_DOMAIN}
 
 # Let's Encrypt
 LETSENCRYPT_EMAIL=mora.corp@yahoo.com.mx
@@ -158,6 +158,8 @@ BACKUP_INTERVAL_SECONDS=86400
 
 ## Paso 6) Generar `N8N_ENCRYPTION_KEY` (Ubuntu)
 
+Esta llave se usa para encriptar credenciales dentro de n8n (tokens, passwords, API keys).
+
 Genera una llave fuerte y guárdala automáticamente dentro del `.env`:
 
 ```bash
@@ -176,7 +178,9 @@ grep '^N8N_ENCRYPTION_KEY=' .env
 
 ## Paso 7) Generar Basic Auth para Portainer (Traefik)
 
-Instala `htpasswd` si no está:
+Este hash se usa para autenticar a Portainer detrás de Traefik. Esto agrega una capa extra antes del login propio de Portainer.
+
+Instalar utilidad htpasswd (Ubuntu)
 ```bash
 sudo apt update && sudo apt install -y apache2-utils
 ```
@@ -381,6 +385,7 @@ services:
       - traefik.http.routers.portainer.middlewares=portainer-ipallow,portainer-auth,portainer-ratelimit,portainer-secure-headers
 
       # Backend Portainer (HTTPS interno self-signed)
+      # Portainer corre HTTPS en 9443 con self-signed por defecto
       - traefik.http.services.portainer.loadbalancer.server.port=9443
       - traefik.http.services.portainer.loadbalancer.server.scheme=https
       - traefik.http.serversTransports.portainer-transport.insecureSkipVerify=true
@@ -414,6 +419,8 @@ services:
       "
 
 volumes:
+  # Reutiliza volúmenes existentes (n8n_data y portainer_data)
+  # Esto referencia el volumen existente (NO lo recrea ni borra)
   n8n_data:
     external: true
   portainer_data:
@@ -462,8 +469,8 @@ docker compose logs -f volume-backup
 
 ## Paso 13) Probar accesos
 
-- **n8n:** `https://n8n-devtallez.pixelia.cloud`
-- **Portainer:** `https://portainer.pixelia.cloud`
+- **n8n:** `https://n8n-devtallez.{VPS_DOMAIN}`
+- **Portainer:** `https://portainer.{VPS_DOMAIN}`
 
 ### Flujo de acceso de Portainer (doble seguridad)
 1. Te pedirá **Basic Auth** (Traefik)
@@ -474,13 +481,16 @@ docker compose logs -f volume-backup
 Desde tu computadora local:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 usuario@srv1355645.hstgr.cloud
+ssh -L 8080:127.0.0.1:8080 usuario@VPS
 ```
 
 Luego abre:
 - `http://localhost:8080/dashboard/`
 
 > **Por qué se hace así:** evita exponer el dashboard a internet, aunque tengas auth. Es más seguro.
+> Esto funciona porque Traefik expone el dashboard solo en loopback del VPS (127.0.0.1), no en internet.
+> Si quieres exponer el dashboard por dominio, puedes descomentar las líneas correspondientes en el archivo `docker-compose.yml` y configurar el dominio en la variable `TRAEFIK_DOMAIN`.
+
 
 ## Paso 15) Comprobar que n8n y Portainer ya NO están expuestos directamente
 
@@ -499,6 +509,11 @@ docker ps --format "table {{.Names}}\t{{.Ports}}"
 sudo ss -tulpn | grep -E '(:80|:443|:8080|:5678|:9443)'
 ```
 
+Resultado esperado:
+- `:80, :443` públicos
+- `127.0.0.1:8080` local
+- `No 0.0.0.0:5678 ni 0.0.0.0:9443`
+
 ---
 
 # Explicación de cada configuración (`.env`)
@@ -513,14 +528,15 @@ Dominio público donde abrirás Portainer.
 Subdominio reservado para Traefik. En esta guía el dashboard no se expone públicamente, pero puedes conservarlo para organización futura.
 
 ## `LETSENCRYPT_EMAIL`
-Correo usado por Let's Encrypt para notificaciones (renovación, errores, etc.).
+Correo usado por Let's Encrypt para notificaciones (renovación, errores, expiración de certificado, etc.).
 
 ## `TZ` / `GENERIC_TIMEZONE`
 Zona horaria para n8n y contenedores auxiliares (ej. backups).
 
 ## `N8N_ENCRYPTION_KEY`
 Llave fija para cifrar credenciales en n8n.
-- **No debe cambiar**
+- Debe ser estable (fija)
+- **No debe cambiar** (si cambia, no podrás descifrar credenciales guardadas en n8n)
 - Guárdala en un password manager
 
 ## `PORTAINER_BASICAUTH_HASH`
@@ -542,18 +558,66 @@ Frecuencia de backup en segundos (`86400` = 24h).
 ## 1) Servicio `traefik` (reverse proxy + HTTPS)
 
 ### Qué hace
-Recibe todo el tráfico HTTP/HTTPS y lo enruta a `n8n` y `portainer` por dominio.
+Traefik es el reverse proxy que recibe todo el tráfico HTTP/HTTPS y lo enruta a cada contenedor `n8n` y `portainer` por dominio.
+
+```yaml
+image: traefik:v3.6.8
+```
+Usa Traefik versión fija (mejor que latest para evitar cambios inesperados).
+
+Si quieres actualizar Traefik, edita el tag en el archivo `docker-compose.yml` y ejecuta:
+```bash
+docker compose pull
+docker compose up -d
+```
 
 ### Puntos clave
-- `providers.docker=true` → detecta contenedores Docker automáticamente
+- image: traefik:v3.6.8 → usa la versión 3.6.8 (mejor que latest para evitar cambios inesperados)
+- `providers.docker=true` → detecta contenedores (lea servicios) Docker automáticamente
 - `exposedbydefault=false` → seguridad (solo expone contenedores con `traefik.enable=true`)
-- `entrypoints.web` y `websecure` → puertos 80/443
-- Redirección HTTP→HTTPS automática
-- Let's Encrypt por HTTP challenge
-- Dashboard habilitado **pero solo local** (`127.0.0.1:8080`)
+- `entrypoints.web` y `websecure` address → puertos 80/443
+- Redirección HTTP→HTTPS automática. Todo lo que llegue se redirige a HTTPS.
+```yaml
+- --entrypoints.web.http.redirections.entrypoint.to=websecure
+- --entrypoints.web.http.redirections.entrypoint.scheme=https
+```
+- Let's Encrypt por HTTP challenge (ACME)
+- Permite emitir y renovar certificados automáticamente.
+```yaml
+- --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
+- --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+- --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+- --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+```
+- Dashboard habilitado **pero solo local** (`127.0.0.1:8080`) (loopback)
+```yaml
+- --api.dashboard=true
+```
 - `--ping=true` + `healthcheck` → healthcheck nativo
 - `docker.sock` en `:ro` (solo lectura) → Traefik detecta servicios
-- Volumen `./letsencrypt` → guarda certificados
+- Volumen `./letsencrypt` → guarda certificados (Let's Encrypt)
+- ports: 80/443 → puertos públicos (HTTP/HTTPS)
+```yaml
+- "80:80"
+- "443:443"
+```
+- `127.0.0.1:8080:8080` → dashboard solo local (loopback)
+```yaml
+- "127.0.0.1:8080:8080"
+```
+- volumes:
+- `docker.sock` en `:ro` (solo lectura) → Traefik detecta servicios
+- Volumen `./letsencrypt` → guarda certificados (Let's Encrypt)
+```yaml
+  - /var/run/docker.sock:/var/run/docker.sock:ro
+  - ./letsencrypt:/letsencrypt
+```
+- `networks:` → conecta Traefik a la red Docker proxy para alcanzar n8n y Portainer.
+```yaml
+  proxy:
+    name: proxy # nombre de la red Docker
+```
+- `healthcheck:` → checkea la salud de Traefik.
 
 ### Por qué el dashboard no es público
 Aunque tenga auth, sigue siendo una superficie de ataque. Con loopback + SSH tunnel, solo tú con acceso SSH puedes verlo.
@@ -563,9 +627,10 @@ Aunque tenga auth, sigue siendo una superficie de ataque. Con loopback + SSH tun
 ## 2) Servicio `n8n` (automatizaciones)
 
 ### Qué hace
-Ejecuta n8n y sirve el editor + webhooks.
+Ejecuta n8n y sirve el editor + webhooks. Es tu motor de automatización.
 
 ### Puntos clave
+- image: docker.n8n.io/n8nio/n8n:2.8.3 → usa la versión 2.8.3 (imagen del registry oficial de n8n)
 - `expose: 5678` → puerto interno (visible para Traefik, no internet)
 - Variables HTTPS:
   - `N8N_PROTOCOL=https`
@@ -573,7 +638,8 @@ Ejecuta n8n y sirve el editor + webhooks.
   - `N8N_EDITOR_BASE_URL`
   - `WEBHOOK_URL`
   - `N8N_SECURE_COOKIE=true`
-- `N8N_ENCRYPTION_KEY` → cifra credenciales
+  Muy importantes para URLs correctas del editor, webhooks funcionales, cookies seguras, etc.
+- `N8N_ENCRYPTION_KEY` → cifra credenciales guardadas
 - Volumen `n8n_data` → persistencia de workflows/config
 - Labels Traefik:
   - Router por `Host(...)`
@@ -584,6 +650,20 @@ Ejecuta n8n y sirve el editor + webhooks.
   - Headers (HSTS, frame deny, nosniff, etc.)
 - Healthcheck con Node → valida que responda en `127.0.0.1:5678`
 
+Variables de ejecuciones (opcionales)
+Controlan retención de datos, pruning y límites.
+```yaml
+- EXECUTIONS_DATA_SAVE_ON_ERROR=all
+- EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+- EXECUTIONS_DATA_PRUNE=true
+- EXECUTIONS_DATA_MAX_AGE=504
+- EXECUTIONS_DATA_PRUNE_MAX_COUNT=10000
+- N8N_CONCURRENCY_PRODUCTION_LIMIT=12
+```
+- volumes:
+```yaml
+- n8n_data:/home/node/.n8n
+```
 ---
 
 ## 3) Servicio `portainer` (administración Docker)
@@ -592,6 +672,7 @@ Ejecuta n8n y sirve el editor + webhooks.
 UI para administrar Docker/containers/volúmenes.
 
 ### Puntos clave
+- image: portainer/portainer-ce:lts → usa la versión LTS (estable recomendada por Portainer)
 - `expose: 9443` → UI HTTPS interna (no pública)
 - `expose: 8000` → Edge agents (opcional)
 - Volúmenes:
@@ -601,7 +682,7 @@ UI para administrar Docker/containers/volúmenes.
   - Router HTTPS por `PORTAINER_DOMAIN`
   - TLS + certresolver
   - Backend HTTPS interno (`server.scheme=https`)
-  - `insecureSkipVerify=true` porque Portainer usa cert self-signed interno
+  - `insecureSkipVerify=true` Portainer suele usar cert self-signed interno, por lo que Traefik debe aceptarlo.
 - Middlewares de seguridad:
   - **IP allowlist** (solo tu IP)
   - **Basic Auth** (doble candado)
@@ -638,27 +719,27 @@ Para restaurar, detén temporalmente el servicio correspondiente (`n8n` o `porta
 |---|---|---|
 | `docker version` | Muestra versión de Docker | Verificar instalación |
 | `docker compose version` | Muestra versión de Compose plugin | Verificar instalación |
-| `docker ps --format "table {{.Names}}\t{{.Ports}}"` | Ver puertos publicados por contenedor | Verificar exposición |
+| `docker ps --format "table {{.Names}}\t{{.Ports}}"` | Ver puertos publicados por contenedor | Verificar exposición de puertos |
 | `docker volume ls` | Listar volúmenes | Confirmar `n8n_data` / `portainer_data` |
-| `docker stop n8n portainer` | Detener contenedores antiguos | Antes de migrar |
-| `docker rm n8n portainer` | Eliminar contenedores antiguos | Antes de migrar |
+| `docker stop n8n portainer` | Detener contenedores | Antes de migrar |
+| `docker rm n8n portainer` | Eliminar contenedores | Recrear con compose |
 | `mkdir -p letsencrypt backups` | Crear carpetas locales | Preparación |
 | `touch letsencrypt/acme.json && chmod 600 letsencrypt/acme.json` | Preparar archivo de certificados | Preparación Traefik |
 | `docker compose config` | Validar compose y variables | Antes de levantar |
-| `docker compose up -d` | Levantar stack | Operación normal |
-| `docker compose ps` | Ver estado de servicios | Verificación |
-| `docker compose logs -f traefik` | Logs de Traefik | Troubleshooting HTTPS/rutas |
-| `docker compose logs -f n8n` | Logs de n8n | Troubleshooting n8n |
-| `docker compose logs -f portainer` | Logs de Portainer | Troubleshooting Portainer |
+| `docker compose up -d` | Levantar stack en segundo plano | Iniciar o aplicar cambios |
+| `docker compose ps` | Ver estado de servicios | Ver si todo subió |
+| `docker compose logs -f traefik` | Logs de Traefik | Troubleshooting HTTPS/rutas/auth |
+| `docker compose logs -f n8n` | Logs de n8n | Debug de n8n |
+| `docker compose logs -f portainer` | Logs de Portainer | Debug de Portainer |
 | `docker compose logs -f volume-backup` | Logs del backup automático | Verificación backups |
 | `docker compose restart` | Reiniciar todo | Mantenimiento |
-| `docker compose restart n8n` | Reiniciar n8n | Cambios puntuales |
+| `docker compose restart n8n` | Reiniciar sólo n8n | Cambios puntuales |
 | `docker compose stop` | Detener stack (sin borrar) | Mantenimiento |
 | `docker compose down` | Bajar stack y quitar contenedores/red | Rebuild o mantenimiento |
 | `docker compose pull` | Descargar nuevas imágenes | Actualizaciones |
 | `docker image prune -f` | Limpiar imágenes no usadas | Liberar espacio |
 | `sudo ss -tulpn | grep ...` | Ver puertos escuchando en host | Confirmar exposición real |
-| `htpasswd -nbB admin 'PASS' \| sed -e 's/\$/\$\$/g'` | Generar hash Basic Auth | Configurar Traefik/Portainer |
+| `htpasswd -nbB admin 'PASS' \| sed -e 's/\$/\$\$/g'` | Generar hash Basic Auth compatible con YAML | Configurar protección de Traefik/Portainer |
 | `ssh -L 8080:127.0.0.1:8080 usuario@VPS` | Túnel SSH al dashboard de Traefik | Acceso interno seguro |
 | `pandoc guia.md -o guia.pdf` | Exportar la guía a PDF | Documentación |
 
@@ -666,7 +747,7 @@ Para restaurar, detén temporalmente el servicio correspondiente (`n8n` o `porta
 
 # Comandos de operación diaria (iniciar, detener, reiniciar, actualizar)
 
-## Iniciar / levantar stack
+## Iniciar todo o aplicar cambios / levantar stack
 ```bash
 docker compose up -d
 ```
@@ -684,9 +765,13 @@ docker compose logs -f portainer
 docker compose logs -f volume-backup
 ```
 
-## Reiniciar
+## Reiniciartodo
 ```bash
 docker compose restart
+```
+
+## Reiniciar servicios individuales
+```bash
 docker compose restart traefik
 docker compose restart n8n
 docker compose restart portainer
@@ -709,6 +794,12 @@ docker compose down
 docker compose pull
 docker compose up -d
 ```
+3. Verifica logs de Traefik y n8n para asegurarte de que todo esté funcionando correctamente.
+```bash
+docker compose logs -f traefik
+docker compose logs -f n8n
+```
+> Tip: actualiza primero en horarios de bajo uso, especialmente n8n.
 
 ## Limpiar imágenes viejas
 ```bash
@@ -889,7 +980,7 @@ Al arrancar puede tardar algunos segundos. El `start_period` ya contempla eso.
 
 ### Túnel correcto
 ```bash
-ssh -L 8080:127.0.0.1:8080 usuario@srv1355645.hstgr.cloud
+ssh -L 8080:127.0.0.1:8080 usuario@VPS
 ```
 
 ### URL correcta
@@ -900,6 +991,11 @@ ssh -L 8080:127.0.0.1:8080 usuario@srv1355645.hstgr.cloud
 ## 8) Error `volume not found`
 Si usas `external: true` y el volumen no existe:
 
+### Verifica si los volúmenes existen
+```bash
+docker volume ls
+```
+Si no existen, créalos:
 ```bash
 docker volume create n8n_data
 docker volume create portainer_data
@@ -908,11 +1004,28 @@ docker volume create portainer_data
 ---
 
 ## 9) `sudo: user is not in sudoers file`
-Entra con `root` o con un usuario con sudo. Para agregar permisos:
+Entra con `root` o con un usuario con sudo. Agrega el usuario al grpupo sudo:
 ```bash
 usermod -aG sudo TU_USUARIO
 ```
 
+## 10) N8N_ENCRYPTION_KEY rota credenciales
+
+### Causa
+La llave de encriptación se perdió o se cambió (configuró) después de crear credenciales en n8n.
+
+### Solución
+Si ya existía un volumen `n8n_data`, leer la llave de encriptación del volumen:
+```bash
+docker exec -it n8n cat /home/node/.n8n/config.json | grep -E 'encryptionKey|N8N_ENCRYPTION_KEY'
+```
+Si no existe, genera una nueva:
+```bash
+KEY="$(openssl rand -base64 32)" && \
+grep -q '^N8N_ENCRYPTION_KEY=' .env \
+  && sed -i "s|^N8N_ENCRYPTION_KEY=.*|N8N_ENCRYPTION_KEY=$KEY|" .env \
+  || echo "N8N_ENCRYPTION_KEY=$KEY" >> .env
+```
 ---
 
 # Glosario de terminología
@@ -936,7 +1049,7 @@ Almacenamiento persistente fuera del contenedor. Conserva datos al recrear conte
 Servicio que recibe tráfico HTTP/HTTPS y lo redirige a otros servicios.
 
 ## Traefik
-Reverse proxy moderno con integración nativa para Docker y Let's Encrypt.
+Reverse proxy moderno con integración nativa para Docker y Let's Encrypt. Reverse proxy moderno para Docker/Kubernetes, con soporte para HTTPS automático, TLS, certificados, etc.
 
 ## Let's Encrypt
 Autoridad certificadora gratuita para emitir certificados TLS/SSL.
@@ -946,6 +1059,9 @@ Protocolo usado para solicitar/renovar certificados Let's Encrypt.
 
 ## HTTP Challenge
 Método de validación de dominio usando el puerto 80.
+
+## Entrypoint (Traefik)
+Puerto/protocolo donde Traefik escucha  (ej. web=80, websecure=443).
 
 ## Router (Traefik)
 Regla que decide qué servicio recibe el tráfico (por dominio, path, etc.).
@@ -957,7 +1073,7 @@ Destino interno al que Traefik reenvía tráfico (puerto del contenedor).
 Procesamiento intermedio: auth, rate limit, headers, IP allowlist, etc.
 
 ## Basic Auth
-Autenticación simple (usuario/contraseña) a nivel HTTP.
+Autenticación simple (usuario/contraseña) a nivel HTTP (como capa extra de seguridad).
 
 ## IP allowlist
 Filtro que solo permite acceso desde IPs específicas.
@@ -974,10 +1090,10 @@ Interfaz local del servidor, no expuesta a internet.
 ## SSH Tunnel (Port Forwarding)
 Túnel seguro para acceder desde tu computadora a un puerto interno del VPS.
 
-## `expose` (Compose)
+## `expose` (Docker Compose)
 Hace visible un puerto solo a otros contenedores de la misma red Docker.
 
-## `ports` (Compose)
+## `ports` (Docker Compose)
 Publica un puerto del contenedor hacia el host (potencialmente público).
 
 ## `docker.sock`
@@ -987,12 +1103,12 @@ Socket del daemon Docker; permite a Traefik y Portainer descubrir/gestionar cont
 
 # Preguntas frecuentes (FAQ)
 
-## 1) ¿Por qué no usar `latest`?
-Porque puede cambiar sin aviso y romper compatibilidad. Es mejor usar versiones pinneadas.
+## 1) ¿Por qué no usar `latest` en las imágenes?
+Porque puede cambiar sin aviso y romper compatibilidad. Es mejor usar versiones fijas (pinneadas).
 
 ## 2) ¿Puedo seguir entrando a n8n por `:5678`?
 No en esta arquitectura. Ahora se accede por:
-- `https://n8n-devtallez.pixelia.cloud`
+- `https://n8n-devtallez.{VPS_DOMAIN}`
 
 ## 3) ¿Por qué Traefik dashboard no es público?
 Por seguridad. Aunque tenga auth, exponerlo aumenta superficie de ataque. Loopback + SSH es más seguro.
@@ -1021,6 +1137,42 @@ docker compose up -d
 
 ## 10) ¿Cómo exporto esta guía?
 Puedes guardarla como `.md` y convertirla con `pandoc` a PDF o HTML (ver sección de exportación).
+
+## 11) ¿Qué pasa si reinicio el VPS?
+Si reinicias el VPS, los contenedores se reiniciarán y perderás la configuración actual.
+Para evitar esto, puedes usar un script de reinicio que guarde la configuración actual y la restaure después del reinicio.
+```bash
+sudo nano /etc/init.d/reboot.sh
+```
+```bash
+sudo chmod +x /etc/init.d/reboot.sh
+```
+> Los servicios se levantan solos por el `restart: unless-stopped` en el compose.
+
+## 12) ¿Cómo puedo hacer backups de los volúmenes?
+Puedes usar `docker compose exec` para ejecutar comandos en los contenedores.
+```bash
+docker compose exec n8n tar -czvf /backups/n8n_data_$(date +%Y%m%d).tar.gz /home/node/.n8n
+```
+```bash
+docker compose exec portainer tar -czvf /backups/portainer_data_$(date +%Y%m%d).tar.gz /var/lib/docker/volumes/portainer_data/_data
+```
+
+## 13) ¿Cómo puedo restaurar los volúmenes desde un backup?
+Puedes usar `docker compose exec` para ejecutar comandos en los contenedores.
+```bash
+docker compose exec n8n tar -xzvf /backups/n8n_data_$(date +%Y%m%d).tar.gz -C /home/node/.n8n
+```
+```bash
+docker compose exec portainer tar -xzvf /backups/portainer_data_$(date +%Y%m%d).tar.gz -C /var/lib/docker/volumes/portainer_data/_data
+```
+
+## 14) ¿Puedo agregar más apps detrás de Traefik?
+Sí. Solo agregas otro service con labels de Traefik y un dominio/subdominio.
+
+## 15) ¿Puedo quitar el Basic Auth de Portainer?
+Sí. Solo elimina el middleware `portainer-basicauth` de los labels de Portainer.
+> No es recomendado. Es una capa extra de seguridad muy útil.
 
 ---
 
@@ -1055,10 +1207,12 @@ code guia-avanzada-completa-traefik-n8n-portainer.md
 
 # Checklist final (paso a paso)
 
-- [ ] DNS de `n8n-devtallez.pixelia.cloud` apunta al VPS
-- [ ] DNS de `portainer.pixelia.cloud` apunta al VPS
-- [ ] DNS de `traefik.pixelia.cloud` apunta al VPS (opcional para esta versión)
-- [ ] UFW permite `80/tcp` y `443/tcp`
+- [ ] DNS de `n8n-devtallez.{VPS_DOMAIN}` apunta al VPS
+- [ ] DNS de `portainer.{VPS_DOMAIN}` apunta al VPS
+- [ ] DNS de `traefik.{VPS_DOMAIN}` apunta al VPS (opcional para esta versión)
+- [ ] Puertos `80/tcp` y `443/tcp` abiertos en el VPS (UFW permite `80/tcp` y `443/tcp`)
+- [ ] Puertos `5678/tcp` y `9443/tcp` cerrados en el VPS (solo internos por Docker network)
+- [ ] Puertos `8080/tcp` cerrado en el VPS (solo loopback `127.0.0.1`)
 - [ ] Existen volúmenes `n8n_data` y `portainer_data`
 - [ ] `.env` creado con dominios, email y timezones
 - [ ] `N8N_ENCRYPTION_KEY` generada y guardada
