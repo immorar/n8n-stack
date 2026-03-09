@@ -196,7 +196,10 @@ services:
     # Solo interno (visible para Traefik, no público)
     expose:
       - "9443"
-      # Si NO usas Edge Agents, puedes quitar 8000
+      # Puerto de Edge Agents (solo red Docker interna — NO ocupa el puerto 8000 del host).
+      # expose: ≠ ports: — no hace binding en el host, solo visible dentro de la red Docker.
+      # Coolify también referencia 8000 en su configuración base; no hay conflicto real.
+      # Quitar si no usas Portainer Edge Agents.
       - "8000"
 
     volumes:
