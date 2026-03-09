@@ -15,6 +15,9 @@ services:
       # EntryPoints
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
+      # Timeout para backends lentos (Coolify/Laravel)
+      - --entrypoints.websecure.transport.respondingTimeouts.readTimeout=120s
+      - --entrypoints.websecure.transport.respondingTimeouts.writeTimeout=120s
 
       # HTTP -> HTTPS
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
@@ -59,6 +62,7 @@ services:
       # - traefik.http.routers.traefik.tls.certresolver=letsencrypt
       # - traefik.http.routers.traefik.service=api@internal
 
+      # Basic Auth para dashboard (generar hash con htpasswd):
       # Basic Auth (ya no es necesario si no lo expones)
       # - traefik.http.middlewares.traefik-auth.basicauth.users=admin:REEMPLAZA_ESTO_POR_TU_HASH
       # - traefik.http.routers.traefik.middlewares=traefik-auth
@@ -75,15 +79,29 @@ services:
       # - traefik.http.routers.traefik.middlewares=traefik-ip
 
   n8n:
-    # image: docker.n8n.io/n8nio/n8n:latest
-    image: docker.n8n.io/n8nio/n8n:2.8.3
+    # VERSION ANTERIOR (vulnerable CVE-2026-21858 "Ni8mare" CVSS 10.0 - NO USAR):
+    # image: docker.n8n.io/n8nio/n8n:2.8.3
+    # ACTUALIZADO 2026-03-08: versión con parches de seguridad aplicados.
+    # Tras verificar estabilidad, pinear a versión específica: docker.n8n.io/n8nio/n8n:X.Y.Z
+    image: docker.n8n.io/n8nio/n8n:latest
     container_name: n8n
     restart: unless-stopped
+
+    # HARDENING [Fase 3]: Previene que procesos dentro del contenedor escalen privilegios.
+    # Bloquea setuid/setgid y prctl(PR_SET_NO_NEW_PRIVS). Crítico dado que n8n puede
+    # ejecutar procesos externos via nodo "Execute Command".
+    security_opt:
+      - no-new-privileges:true
+
     networks:
       - proxy
 
     # IMPORTANTE: ya no exponemos 5678 al host público
     # No publicamos 5678 al host (solo interno para Traefik)
+    # IMPORTANTE: Solo expose (red Docker interna para Traefik).
+    # ELIMINADO [Fase 2]: ports: "127.0.0.1:5678:5678" — innecesario y amplía
+    # la superficie de ataque al exponer n8n a otros procesos del host sin pasar
+    # por los middlewares de Traefik (rate limit, headers, etc.).
     expose:
       - "5678"
 
@@ -98,7 +116,7 @@ services:
       - WEBHOOK_URL=https://${N8N_DOMAIN}/
       - N8N_SECURE_COOKIE=true
 
-      # Encriptación de credenciales
+      # Encriptación de credenciales (NO CAMBIAR después de crear credenciales)
       - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
 
       # (Opcional recomendado) Si tendrás webhooks/tiempo real más estable
@@ -116,11 +134,18 @@ services:
       # Deprecation warning: The storage directory "/home/node/.n8n/binaryData" will be renamed to "/home/node/.n8n/storage" in n8n v3.
       - N8N_MIGRATE_FS_STORAGE_PATH=true
 
+      # SEGURIDAD [Fase 0 - CRITICAL]: Bloquea acceso a variables de entorno desde nodos Code.
+      # Sin esta flag, un workflow puede ejecutar process.env.N8N_ENCRYPTION_KEY y exfiltrar
+      # todos los secretos del proceso. Relacionado con CVE-2025-68613, CVE-2025-68668.
+      # NOTA: Workflows existentes que usen process.env.* dejarán de funcionar.
+      # Alternativa: usar Credenciales de n8n o variables de workflow.
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=true
+
     volumes:
       - n8n_data:/home/node/.n8n
 
-    ports:
-      - "127.0.0.1:5678:5678"
+    # ports:
+    #   - "127.0.0.1:5678:5678"
 
     labels:
       - traefik.enable=true
@@ -130,9 +155,36 @@ services:
       - traefik.http.routers.n8n.entrypoints=websecure
       - traefik.http.routers.n8n.tls=true
       - traefik.http.routers.n8n.tls.certresolver=letsencrypt
-      
+
       # Service -> puerto interno del contenedor
       - traefik.http.services.n8n.loadbalancer.server.port=5678
+
+      # --- MIDDLEWARES DE SEGURIDAD n8n [Fase 2, añadidos 2026-03-08] ---
+
+      # Rate limiting: algoritmo token bucket de Traefik.
+      # Protege contra brute force de login, abuso de webhooks y ataques volumétricos.
+      # average=100 req/s en estado estable; burst=200 permite picos legítimos (ej. webhooks).
+      # Si el cliente supera el límite, Traefik responde 429 Too Many Requests.
+      - traefik.http.middlewares.n8n-ratelimit.ratelimit.average=100
+      - traefik.http.middlewares.n8n-ratelimit.ratelimit.burst=200
+      - traefik.http.middlewares.n8n-ratelimit.ratelimit.period=1s
+
+      # Security headers: protege a los usuarios del navegador contra ataques comunes.
+      # HSTS (31536000s = 1 año): fuerza HTTPS; el navegador nunca intentará HTTP.
+      # stsIncludeSubdomains: aplica HSTS a todos los subdominios del dominio.
+      # stsPreload: permite agregar el dominio a la lista preload de navegadores.
+      # contentTypeNosniff: previene MIME sniffing (vector de XSS).
+      # browserXssFilter: activa filtro XSS en navegadores legacy (IE/Edge legacy).
+      # frameDeny: bloquea embedding en <iframe> (previene clickjacking).
+      - traefik.http.middlewares.n8n-headers.headers.stsSeconds=31536000
+      - traefik.http.middlewares.n8n-headers.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.n8n-headers.headers.stsPreload=true
+      - traefik.http.middlewares.n8n-headers.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.n8n-headers.headers.browserXssFilter=true
+      - traefik.http.middlewares.n8n-headers.headers.frameDeny=true
+
+      # Aplicar cadena de middlewares al router n8n (orden: rate limit → headers)
+      - traefik.http.routers.n8n.middlewares=n8n-ratelimit,n8n-headers
 
   portainer:
     image: portainer/portainer-ce:lts
@@ -164,12 +216,82 @@ services:
       - traefik.http.services.portainer.loadbalancer.server.port=9443
       - traefik.http.services.portainer.loadbalancer.server.scheme=https
 
-      # Traefik debe aceptar el cert self-signed de Portainer (transport en traefik-dynamic.yml)
+      # Traefik acepta el cert self-signed de Portainer (insecureSkipVerify en traefik-dynamic.yml)
       # -traefik.http.services.serversTransport.portainer-transport.insecureSkipVerify=true
       - traefik.http.services.portainer.loadbalancer.serverstransport=portainer-transport@file
 
+      # --- MIDDLEWARES DE SEGURIDAD Portainer [Fase 2, añadidos 2026-03-08] ---
+
+      # Rate limiting más estricto para panel de administración.
+      # Portainer no debe recibir tráfico masivo. 20 req/s es suficiente para uso manual interactivo.
+      # Limita ataques de brute force contra el login de Portainer.
+      - traefik.http.middlewares.portainer-ratelimit.ratelimit.average=20
+      - traefik.http.middlewares.portainer-ratelimit.ratelimit.burst=40
+      - traefik.http.middlewares.portainer-ratelimit.ratelimit.period=1s
+
+      # Security headers para Portainer
+      - traefik.http.middlewares.portainer-headers.headers.stsSeconds=31536000
+      - traefik.http.middlewares.portainer-headers.headers.stsIncludeSubdomains=true
+      - traefik.http.middlewares.portainer-headers.headers.contentTypeNosniff=true
+      - traefik.http.middlewares.portainer-headers.headers.frameDeny=true
+
+      # IP Allowlist [Fase 2]: Solo IPs en PORTAINER_ALLOWED_IPS pueden acceder a Portainer.
+      # Valor actual en .env: 0.0.0.0/0 (sin restricción — cambiar a tu IP real).
+      # Cambia PORTAINER_ALLOWED_IPS en .env a tu IP pública: ej. 203.0.113.10/32
+      # Luego: docker compose up -d portainer
+      - traefik.http.middlewares.portainer-ipallow.ipallowlist.sourcerange=${PORTAINER_ALLOWED_IPS}
+
+      # Basic Auth [Fase 2]: Segunda capa de autenticación (ACTIVAR MANUALMENTE).
+      # Por qué: si Portainer tiene una vulnerabilidad (ej. CVE-2024-29296), el Basic Auth
+      # de Traefik actúa como primera línea de defensa antes de que la request llegue a Portainer.
+      #
+      # PASOS para activar:
+      #   1. sudo apt install apache2-utils
+      #   2. htpasswd -nbB admin 'TU_PASSWORD_SUPER_SEGURA' | sed -e 's/\$/\$\$/g'
+      #   3. Pegar resultado en PORTAINER_BASICAUTH_HASH en .env
+      #   4. Descomentar la línea siguiente:
+      # - traefik.http.middlewares.portainer-auth.basicauth.users=${PORTAINER_BASICAUTH_HASH}
+      #   5. Agregar portainer-auth a la línea de middlewares abajo
+      #   6. docker compose up -d portainer
+
+      # Cadena activa (agregar portainer-auth cuando configures el hash):
+      - traefik.http.routers.portainer.middlewares=portainer-ipallow,portainer-ratelimit,portainer-headers
+
+  # Backup automático de volúmenes críticos [Fase 3, añadido 2026-03-08]
+  # Protección contra: fallo de disco, error humano, ransomware, migraciones.
+  # Genera tar.gz cada BACKUP_INTERVAL_SECONDS. Retiene BACKUP_RETENTION_DAYS días.
+  # Monta volúmenes en :ro para no interferir con los servicios en ejecución.
+  volume-backup:
+    image: alpine:3.20
+    container_name: volume-backup
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - TZ=${TZ}
+      - BACKUP_RETENTION_DAYS=${BACKUP_RETENTION_DAYS:-14}
+      - BACKUP_INTERVAL_SECONDS=${BACKUP_INTERVAL_SECONDS:-86400}
+    volumes:
+      - n8n_data:/src/n8n_data:ro
+      - portainer_data:/src/portainer_data:ro
+      - ./backups:/backups
+    command: >
+      sh -c "
+      apk add --no-cache tzdata tar gzip &&
+      mkdir -p /backups &&
+      while true; do
+        TS=$$(date +%F_%H-%M-%S);
+        echo '[backup] creando respaldo '$$TS;
+        tar -czf /backups/n8n_data_$$TS.tar.gz -C /src n8n_data &&
+        tar -czf /backups/portainer_data_$$TS.tar.gz -C /src portainer_data &&
+        find /backups -type f -name '*.tar.gz' -mtime +$${BACKUP_RETENTION_DAYS} -delete;
+        echo '[backup] completado, siguiente en '$${BACKUP_INTERVAL_SECONDS}'s';
+        sleep $${BACKUP_INTERVAL_SECONDS};
+      done
+      "
+
 volumes:
-  # Esto referencia el volumen existente (NO lo recrea ni borra)
+  # Referencia volúmenes existentes (NO los recrea ni borra datos)
   n8n_data:
     external: true
   portainer_data:

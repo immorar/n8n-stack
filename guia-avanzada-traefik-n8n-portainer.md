@@ -1239,3 +1239,512 @@ Si más adelante quieres una versión aún más robusta, se puede extender con:
 - Alertas (Telegram/Slack) para healthchecks/backups
 - Autenticación adicional (Authelia, OAuth, etc.)
 - Monitoreo con Prometheus/Grafana
+
+---
+
+# Actualizaciones de Seguridad — 2026-03-08
+
+> Esta sección documenta los cambios implementados tras la auditoría de seguridad del 2026-03-08.
+> Cada cambio incluye justificación técnica, diagrama de impacto y preguntas frecuentes.
+
+## Resumen de cambios implementados
+
+| # | Fase | Componente | Cambio implementado | Severidad atendida |
+|---|------|------------|---------------------|--------------------|
+| 1 | 0 — Crítica | n8n | Actualización imagen (CVE-2026-21858 "Ni8mare" CVSS 10.0) | CRITICAL |
+| 2 | 0 — Crítica | n8n | `N8N_BLOCK_ENV_ACCESS_IN_NODE=true` | CRITICAL |
+| 3 | 2 — Corto plazo | n8n (Traefik) | Rate limiting 100 req/s | MEDIUM |
+| 4 | 2 — Corto plazo | n8n (Traefik) | Security headers (HSTS, frame deny, nosniff, XSS) | MEDIUM |
+| 5 | 2 — Corto plazo | n8n | Eliminación binding `127.0.0.1:5678` redundante | MEDIUM |
+| 6 | 2 — Corto plazo | Portainer (Traefik) | Rate limiting 20 req/s | MEDIUM |
+| 7 | 2 — Corto plazo | Portainer (Traefik) | Security headers | MEDIUM |
+| 8 | 2 — Corto plazo | Portainer (Traefik) | IP Allowlist configurable (default: abierto) | MEDIUM |
+| 9 | 2 — Corto plazo | Portainer (Traefik) | Basic Auth instrucciones (activar manualmente) | MEDIUM |
+| 10 | 3 — Medio plazo | n8n | `security_opt: no-new-privileges:true` | MEDIUM |
+| 11 | 3 — Medio plazo | Infraestructura | Servicio `volume-backup` automático | MEDIUM |
+
+---
+
+## Arquitectura de seguridad: antes vs. después
+
+### Antes — Sin middlewares de seguridad activos
+
+```mermaid
+flowchart LR
+    Internet([Internet]) -->|HTTPS| Traefik
+    Traefik -->|Sin rate limit\nSin headers\nSin auth extra| N8N[n8n :5678]
+    Traefik -->|Sin filtro IP\nSin Basic Auth\nSin headers| Portainer[Portainer :9443]
+    Process[Proceso en VPS] -->|127.0.0.1:5678\nSin middlewares| N8N
+```
+
+### Después — Con todas las capas de seguridad activas
+
+```mermaid
+flowchart LR
+    Internet([Internet]) -->|HTTPS| T[Traefik]
+
+    T --> N8N_CHAIN{Cadena n8n}
+    N8N_CHAIN --> RL_N[RateLimit\n100 req/s]
+    RL_N --> H_N[Headers\nHSTS · frame deny\nnosniff · XSS]
+    H_N --> N8N[n8n :5678\nvía red proxy]
+
+    T --> P_CHAIN{Cadena Portainer}
+    P_CHAIN --> IP[IPAllowList\nsolo tu IP]
+    IP --> AUTH[BasicAuth\nuser:pass]
+    AUTH --> RL_P[RateLimit\n20 req/s]
+    RL_P --> H_P[Headers\nHSTS · frame deny]
+    H_P --> Port[Portainer :9443\nvía red proxy]
+
+    Process[Proceso en VPS] -. bloqueado .-> N8N
+```
+
+---
+
+## Cadena de middlewares Traefik (secuencia de una petición)
+
+```mermaid
+sequenceDiagram
+    participant C as Cliente (browser)
+    participant T as Traefik
+    participant RL as RateLimit
+    participant H as Headers MW
+    participant S as Servicio (n8n / Portainer)
+
+    C->>T: HTTPS GET /
+    T->>RL: ¿dentro del límite?
+    alt Excede el límite
+        RL-->>C: 429 Too Many Requests
+    end
+    RL->>H: Pasa (dentro del límite)
+    H->>S: Request + forwarded headers
+    S-->>H: Response
+    H-->>C: Response + Strict-Transport-Security\n+ X-Frame-Options: DENY\n+ X-Content-Type-Options: nosniff
+```
+
+---
+
+## Cambio 1 y 2: Actualización n8n + bloqueo de acceso a env
+
+### ¿Qué se cambió?
+
+```yaml
+# ANTES:
+image: docker.n8n.io/n8nio/n8n:2.8.3
+
+# DESPUÉS:
+image: docker.n8n.io/n8nio/n8n:latest
+# + nuevo en environment:
+- N8N_BLOCK_ENV_ACCESS_IN_NODE=true
+```
+
+### Justificación
+
+n8n 2.8.3 tiene vulnerabilidades activas de severidad máxima:
+
+| CVE | CVSS | Descripción | Autenticación requerida |
+|-----|------|-------------|------------------------|
+| CVE-2026-21858 "Ni8mare" | **10.0** | RCE via file upload sin autenticación | **NO** |
+| CVE-2026-21877 | **10.0** | Upload de archivos peligrosos → RCE | Sí |
+| CVE-2025-68668 "N8scape" | **9.9** | Sandbox bypass en nodos Code | Sí |
+| CVE-2025-68613 | **9.9** | Expression injection RCE | Sí |
+
+`N8N_BLOCK_ENV_ACCESS_IN_NODE=true` cierra el vector de exfiltración de la `N8N_ENCRYPTION_KEY` (que descifraría todas las credenciales almacenadas).
+
+### Diagrama de impacto de CVE-2026-21858
+
+```mermaid
+flowchart TD
+    A([Atacante anónimo]) -->|HTTP POST /webhook/upload| N8N_VULN[n8n 2.8.3 vulnerable]
+    N8N_VULN -->|Ejecuta código arbitrario| HOST[Proceso en contenedor]
+    HOST -->|Lee /home/node/.n8n/config| KEY[N8N_ENCRYPTION_KEY]
+    KEY -->|Descifra todas las credenciales| CREDS[API keys · OAuth tokens · Passwords]
+
+    A2([Atacante anónimo]) -->|HTTP POST /webhook/upload| N8N_PATCH[n8n latest parcheado]
+    N8N_PATCH -->|Valida el upload| BLOCK[403 Blocked]
+```
+
+### FAQ
+
+**¿Por qué `latest` y no una versión fija?**
+Ante un CVE activo con CVSS 10.0 la prioridad es el parche inmediato. Una vez verificada la estabilidad, pinear:
+```bash
+docker exec n8n n8n --version   # ver versión instalada
+# Luego editar docker-compose.yaml: image: docker.n8n.io/n8nio/n8n:X.Y.Z
+docker compose up -d n8n
+```
+
+**¿La actualización borra mis workflows?**
+No. Los datos viven en el volumen externo `n8n_data`. El contenedor es efímero; los datos persisten.
+
+**¿`N8N_BLOCK_ENV_ACCESS_IN_NODE` rompe workflows existentes?**
+Solo los que usen `$env` o `process.env.*` en nodos Code. Si tienes workflows así, migra los valores a **Credenciales de n8n** o variables de workflow.
+
+**¿Cómo actualizar n8n en el futuro?**
+```bash
+cd ~/n8n-stack
+docker compose pull n8n
+docker compose up -d n8n
+docker compose logs -f n8n   # verificar arranque
+```
+
+---
+
+## Cambio 3 y 4: Rate limiting y security headers para n8n
+
+### ¿Qué se añadió?
+
+```yaml
+# Nuevos labels en el servicio n8n:
+- traefik.http.middlewares.n8n-ratelimit.ratelimit.average=100
+- traefik.http.middlewares.n8n-ratelimit.ratelimit.burst=200
+- traefik.http.middlewares.n8n-ratelimit.ratelimit.period=1s
+- traefik.http.middlewares.n8n-headers.headers.stsSeconds=31536000
+- traefik.http.middlewares.n8n-headers.headers.stsIncludeSubdomains=true
+- traefik.http.middlewares.n8n-headers.headers.stsPreload=true
+- traefik.http.middlewares.n8n-headers.headers.contentTypeNosniff=true
+- traefik.http.middlewares.n8n-headers.headers.browserXssFilter=true
+- traefik.http.middlewares.n8n-headers.headers.frameDeny=true
+- traefik.http.routers.n8n.middlewares=n8n-ratelimit,n8n-headers
+```
+
+### Justificación por componente
+
+**Rate limiting (token bucket)**
+
+Sin rate limit, un atacante puede:
+- Intentar contraseñas a alta velocidad (brute force del login)
+- Enviar miles de webhooks para saturar la CPU del VPS
+- Automatizar la explotación de CVEs con múltiples payloads
+
+El algoritmo token bucket de Traefik:
+- `average=100`: genera 100 tokens por segundo
+- `burst=200`: permite acumular hasta 200 tokens (picos legítimos de webhooks)
+- Responde `429 Too Many Requests` al agotarse los tokens
+
+**Security Headers**
+
+| Header | Ataque mitigado | Cómo funciona |
+|--------|-----------------|---------------|
+| `Strict-Transport-Security` | Downgrade HTTP→HTTPS, SSL stripping | El navegador recordará usar solo HTTPS por 1 año |
+| `X-Content-Type-Options: nosniff` | MIME sniffing → XSS | Impide que el browser re-interprete el tipo de contenido |
+| `X-XSS-Protection` | XSS en navegadores legacy | Activa el filtro XSS nativo de IE/Edge legacy |
+| `X-Frame-Options: DENY` | Clickjacking / UI redressing | Impide que n8n sea embebido en `<iframe>` |
+
+### FAQ
+
+**¿El rate limit afecta los webhooks de n8n?**
+A 100 req/s rara vez. Si tienes sistemas que disparan muchos webhooks simultáneos, aumenta `average` y `burst` en las labels.
+
+**¿Cómo verificar que los middlewares están activos?**
+```bash
+# Via SSH tunnel al dashboard de Traefik:
+ssh -L 8080:127.0.0.1:8080 usuario@VPS_IP
+# Abrir: http://localhost:8080/dashboard/#/http/middlewares
+# Deben aparecer: n8n-ratelimit, n8n-headers, portainer-ratelimit, portainer-headers, portainer-ipallow
+
+# O verificar headers en la respuesta:
+curl -I https://n8n-devtallez.pixelia.cloud | grep -i strict
+# Debe mostrar: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+```
+
+**¿Qué pasa si recibo muchos 429?**
+```bash
+docker compose logs traefik | grep "429"
+# Ver la IP que genera los 429
+```
+
+---
+
+## Cambio 5: Eliminación del binding 127.0.0.1:5678 de n8n
+
+### ¿Qué se cambió?
+
+```yaml
+# ELIMINADO del servicio n8n:
+ports:
+  - "127.0.0.1:5678:5678"
+
+# PERMANECE (necesario para Traefik):
+expose:
+  - "5678"
+```
+
+### Justificación
+
+```mermaid
+flowchart TD
+    subgraph ANTES ["ANTES — con ports: 127.0.0.1:5678"]
+        Traefik_A -->|red proxy Docker| N8N_A[n8n]
+        CronJob[cron job en VPS] -->|127.0.0.1:5678\nSIN middlewares Traefik| N8N_A
+        Script[script malicioso] -->|127.0.0.1:5678\nSIN rate limit ni headers| N8N_A
+    end
+
+    subgraph DESPUÉS ["DESPUÉS — solo expose:5678"]
+        Traefik_B -->|red proxy Docker| N8N_B[n8n]
+        CronJob_B[cron job en VPS] -. no puede alcanzar .-> N8N_B
+        Script_B[script malicioso] -. bloqueado .-> N8N_B
+    end
+```
+
+`expose:` hace el puerto accesible solo a contenedores en la misma red Docker.
+`ports: 127.0.0.1:5678` lo hacía adicionalmente accesible desde el host, evitando todos los middlewares de Traefik.
+
+### FAQ
+
+**¿El editor de n8n sigue funcionando?**
+Sí. Traefik accede a n8n via la red Docker `proxy`, no por el puerto del host.
+
+**¿Cómo hago debugging de n8n sin el puerto?**
+```bash
+docker compose logs -f n8n
+docker exec -it n8n sh
+# O temporalmente, agrega ports: de vuelta para debugging y quítalo luego.
+```
+
+---
+
+## Cambios 6-9: Middlewares de seguridad para Portainer
+
+### ¿Qué se añadió?
+
+```yaml
+# Rate limiting:
+- traefik.http.middlewares.portainer-ratelimit.ratelimit.average=20
+- traefik.http.middlewares.portainer-ratelimit.ratelimit.burst=40
+
+# Security headers:
+- traefik.http.middlewares.portainer-headers.headers.stsSeconds=31536000
+- traefik.http.middlewares.portainer-headers.headers.frameDeny=true
+- traefik.http.middlewares.portainer-headers.headers.contentTypeNosniff=true
+
+# IP Allowlist (configurar en .env):
+- traefik.http.middlewares.portainer-ipallow.ipallowlist.sourcerange=${PORTAINER_ALLOWED_IPS}
+
+# Basic Auth (activar manualmente — instrucciones en docker-compose.yaml y .env):
+# - traefik.http.middlewares.portainer-auth.basicauth.users=${PORTAINER_BASICAUTH_HASH}
+```
+
+### Flujo de seguridad de Portainer con capas activas
+
+```mermaid
+sequenceDiagram
+    participant A as Atacante (IP desconocida)
+    participant U as Administrador (IP permitida)
+    participant T as Traefik
+    participant P as Portainer
+
+    A->>T: GET https://portainer.pixelia.cloud
+    T-->>A: 403 Forbidden (IPAllowList: IP no está en lista)
+
+    U->>T: GET https://portainer.pixelia.cloud
+    T->>T: IPAllowList: IP en lista ✓
+    T->>T: BasicAuth: solicita credenciales (si está activo)
+    U->>T: Authorization: Basic ...
+    T->>T: BasicAuth: credenciales válidas ✓
+    T->>T: RateLimit: dentro del límite ✓
+    T->>T: Headers: añade HSTS, X-Frame-Options
+    T->>P: Request forwarded
+    P-->>U: Pantalla de login de Portainer
+```
+
+### Cómo activar Basic Auth para Portainer
+
+```bash
+# 1. Instalar htpasswd
+sudo apt update && sudo apt install -y apache2-utils
+
+# 2. Generar hash BCrypt (reemplaza TU_PASSWORD_SUPER_SEGURA)
+htpasswd -nbB admin 'TU_PASSWORD_SUPER_SEGURA' | sed -e 's/\$/\$\$/g'
+# Salida ejemplo: admin:$$2y$$05$$abc123...
+
+# 3. Pegar en .env (descomentar la línea PORTAINER_BASICAUTH_HASH):
+nano ~/n8n-stack/.env
+# PORTAINER_BASICAUTH_HASH=admin:$$2y$$05$$abc123...
+
+# 4. En docker-compose.yaml, descomentar:
+# - traefik.http.middlewares.portainer-auth.basicauth.users=${PORTAINER_BASICAUTH_HASH}
+# Y actualizar la línea de middlewares a:
+# - traefik.http.routers.portainer.middlewares=portainer-ipallow,portainer-auth,portainer-ratelimit,portainer-headers
+
+# 5. Aplicar
+docker compose up -d portainer
+```
+
+### Cómo configurar IP Allowlist real
+
+```bash
+# 1. Obtener tu IP pública actual
+curl -s ifconfig.me
+# Salida ejemplo: 203.0.113.10
+
+# 2. Editar .env
+nano ~/n8n-stack/.env
+# PORTAINER_ALLOWED_IPS=203.0.113.10/32
+
+# 3. Aplicar
+docker compose up -d portainer
+
+# Si te bloqueas (cambió tu IP o te equivocaste):
+# Editar .env con la nueva IP o poner 0.0.0.0/0 temporalmente
+# docker compose up -d portainer
+```
+
+### FAQ
+
+**¿Por qué Basic Auth en Portainer si ya tiene su propio login?**
+Defense in depth (defensa en profundidad). Si Portainer tiene una vulnerabilidad de autenticación (como CVE-2024-29296: user enumeration, o futuras), el Basic Auth de Traefik actúa ANTES de que la request llegue a Portainer. El atacante debe superar ambas capas.
+
+**¿El rate limit de Portainer puede afectar mi trabajo normal?**
+No. 20 req/s en Portainer es amplio para uso interactivo humano. El browser rara vez envía más de 2-3 requests simultáneas.
+
+---
+
+## Cambio 10: no-new-privileges en n8n
+
+### ¿Qué se añadió?
+
+```yaml
+# En el servicio n8n:
+security_opt:
+  - no-new-privileges:true
+```
+
+### Justificación
+
+```mermaid
+flowchart TD
+    subgraph ANTES ["Sin no-new-privileges"]
+        E[Exploit en n8n] -->|setuid binario| ROOT[UID 0 root]
+        ROOT -->|prctl setuid| ESCAPE[Escalada de privilegios]
+    end
+
+    subgraph DESPUÉS ["Con no-new-privileges:true"]
+        E2[Exploit en n8n] -->|intenta setuid| BLOCK2[Kernel bloquea]
+        BLOCK2 -->|EPERM| FAIL[Escalada fallida]
+    end
+```
+
+La flag `no-new-privileges` llama a `prctl(PR_SET_NO_NEW_PRIVS, 1)` en el proceso. Desde ese momento, ningún proceso hijo puede adquirir más privilegios que el padre, incluso si hay binarios con bit setuid dentro de la imagen.
+
+Especialmente relevante para n8n porque el nodo **Execute Command** puede correr procesos externos.
+
+### FAQ
+
+**¿Puede romper el funcionamiento de n8n?**
+No. n8n no necesita escalar privilegios para operar normalmente.
+
+---
+
+## Cambio 11: Servicio de backup automático
+
+### ¿Qué se añadió?
+
+El servicio `volume-backup` en el compose genera backups automáticos de `n8n_data` y `portainer_data`.
+
+### Justificación
+
+Sin backups, los siguientes escenarios resultan en pérdida total e irrecuperable:
+
+| Escenario | Pérdida sin backup |
+|-----------|-------------------|
+| Fallo de disco del VPS | 100% de datos |
+| `docker compose down -v` accidental | 100% de datos |
+| Corrupción de volumen | Parcial o total |
+| Ransomware | 100% de datos (cifrados) |
+| Error humano (delete workflow) | Parcial |
+
+Los datos críticos en `n8n_data`:
+- Todos los workflows
+- Credenciales cifradas (API keys, OAuth tokens, passwords)
+- Historial de ejecuciones
+
+### Cómo gestionar backups
+
+```bash
+# Ver backups disponibles
+ls -lh ~/n8n-stack/backups/
+
+# Restaurar n8n desde backup (DETENER n8n antes)
+docker compose stop n8n
+docker run --rm \
+  -v n8n_data:/restore \
+  -v $(pwd)/backups:/backups \
+  alpine:3.20 \
+  sh -c "cd /restore && rm -rf ./* && tar -xzf /backups/n8n_data_YYYY-MM-DD_HH-MM-SS.tar.gz --strip-components=1"
+docker compose start n8n
+
+# Ver logs del backup
+docker compose logs -f volume-backup
+
+# Cambiar frecuencia en .env:
+BACKUP_INTERVAL_SECONDS=43200  # 12 horas
+BACKUP_RETENTION_DAYS=30       # 30 días
+```
+
+### FAQ
+
+**¿Los backups locales son suficientes?**
+Son el primer nivel. Para protección real ante pérdida del VPS, copiarlos a almacenamiento externo:
+```bash
+# Con rclone (configurar previamente):
+rclone copy ~/n8n-stack/backups/ remote:bucket/n8n-backups/
+```
+
+**¿Los backups incluyen credenciales?**
+Sí, cifradas con `N8N_ENCRYPTION_KEY`. Sin esa clave, los backups son inútiles para un atacante pero también para la restauración. Guarda la clave en un password manager.
+
+---
+
+## Checklist de verificación post-implementación (n8n-stack)
+
+```bash
+# Paso 1: Validar YAML del compose
+cd ~/n8n-stack && docker compose config
+
+# Paso 2: Crear directorio de backups
+mkdir -p backups
+
+# Paso 3: Desplegar cambios
+docker compose pull n8n   # Descarga nueva versión de n8n
+docker compose up -d      # Aplica todos los cambios
+
+# Paso 4: Verificar versión de n8n
+docker exec n8n n8n --version
+# Debe mostrar versión > 2.8.3
+
+# Paso 5: Verificar N8N_BLOCK_ENV_ACCESS_IN_NODE activo
+docker exec n8n env | grep BLOCK_ENV
+# Debe mostrar: N8N_BLOCK_ENV_ACCESS_IN_NODE=true
+
+# Paso 6: Verificar n8n NO expuesto en host
+docker ps --format "table {{.Names}}\t{{.Ports}}" | grep n8n
+# La columna Ports de n8n debe estar VACÍA
+
+# Paso 7: Verificar redirección HTTP→HTTPS
+curl -I http://n8n-devtallez.pixelia.cloud
+# Debe mostrar 301 Moved Permanently con Location: https://...
+
+# Paso 8: Verificar HSTS activo
+curl -sI https://n8n-devtallez.pixelia.cloud | grep -i strict
+# Debe mostrar: Strict-Transport-Security: max-age=31536000...
+
+# Paso 9: Verificar backups generándose
+docker compose logs volume-backup
+ls -la backups/
+
+# Paso 10: Verificar puertos en el host
+sudo ss -tulpn | grep '0\.0\.0\.0'
+# Solo debe mostrar :80 y :443
+```
+
+---
+
+## Acciones manuales pendientes (post-implementación)
+
+| Acción | Prioridad | Instrucciones |
+|--------|-----------|---------------|
+| Pinear versión de n8n a X.Y.Z específica | Alta | Ver "FAQ: ¿Por qué latest?" arriba |
+| Configurar IP real en `PORTAINER_ALLOWED_IPS` | Alta | Ver "Cómo configurar IP Allowlist real" arriba |
+| Activar Basic Auth para Portainer | Media | Ver "Cómo activar Basic Auth para Portainer" arriba |
+| Configurar backup offsite (S3/Backblaze) | Media | Usar `rclone` con crontab |
+| Verificar versión de runc (`runc --version`) | Baja | Debe ser >= 1.1.12 (CVE-2024-21626) |

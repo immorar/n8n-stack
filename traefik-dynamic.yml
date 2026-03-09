@@ -1,6 +1,11 @@
 # Dynamic configuration for Traefik
 # ServersTransport for Portainer (accepts self-signed backend cert)
+# ServersTransport for Coolify (Laravel puede tardar en responder)
 http:
   serversTransports:
     portainer-transport:
       insecureSkipVerify: true
+    coolify-transport:
+      forwardingTimeouts:
+        dialTimeout: "120s"
+        responseHeaderTimeout: "120s"
